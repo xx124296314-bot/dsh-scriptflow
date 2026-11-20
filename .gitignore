@@ -1,0 +1,18 @@
+# runtime output of the plugin (never commit deliverables)
+output/
+jobs/
+*.log
+
+# local config / secrets
+config.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

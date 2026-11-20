@@ -1,0 +1,7 @@
+- insert:
+    - id: scriptflow
+      name: 'dsh-scriptflow'
+      config:
+        home: 'E:/Tools/scriptflow-home'
+        python: 'E:/Tools/sv-engine/Scripts/python.exe'
+        engine: 'sensevoice'

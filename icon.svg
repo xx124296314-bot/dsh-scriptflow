@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="ScriptFlow">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6b76d8"/>
+      <stop offset="1" stop-color="#37c3d6"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="15" fill="url(#g)"/>
+  <path d="M26 20.5v23l18-11.5z" fill="#0b0d14" opacity="0.92"/>
+  <rect x="14" y="47.5" width="36" height="3.4" rx="1.7" fill="#0b0d14" opacity="0.55"/>
+</svg>
