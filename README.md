@@ -33,16 +33,24 @@ plugin_manager install_bundle target=E:\Tools\dsh-scriptflow
 
 ## 用法
 
-同步跑（几十秒的片子十几秒出结果）：
+单条，同步跑（几十秒的片子十几秒出结果）：
 
 ```
 sf_run url=https://v.douyin.com/xxxxxx/
 ```
 
-后台跑（长视频或批量时用）：
+**批量**：`url` 里一行一条，一次跑多条（按顺序跑完，每条各出一份 mp4 + Word）：
 
 ```
-sf_run url=<链接或分享口令> background=true
+sf_run url=https://v.douyin.com/aaaaaa/
+https://v.douyin.com/bbbbbb/
+7706703615318578789
+```
+
+批量想限制条数就加 `limit=10`；怕等太久就加 `background=true`，然后轮询：
+
+```
+sf_run url=<多行链接> background=true
 sf_job action=status id=sfxxxx
 ```
 
@@ -51,6 +59,8 @@ sf_job action=status id=sfxxxx
 ```
 sf_job action=cancel id=sfxxxx
 ```
+
+批量结果里，每条都有独立的 `title / author / paragraphs / videoPath / docxPath`；单条失败不会中断整批，失败条目会在 `items` 里带 `ok:false` 和原因。
 
 ## 交付物
 
@@ -78,11 +88,12 @@ sf_job action=cancel id=sfxxxx
 1. **本地规则**：补标点、合并被切开的词、术语表替换（库里的 `terms` 表）、跨段重复字拼接。
 2. **DeepSeek**：把标题、作者、话题作为上下文，只允许改错字与断句；段数不许变多、总字数偏差超过 30% 直接丢弃这版结果。
 
-大模型改不了「听错」：如果识别把一句歌词听成了别的词，校对不会替你编造，需要换云端识别或加术语表。
+大模型改不了「听错」：如果识别把一句歌词听成了别的词，校对不会替你编造，需要换云端识别或加术语表。音乐/重复歌词的片子，标点和分段偶尔还会不完美。
 
 ## 已知限制
 
-- 只支持抖音（作品链接 / 分享口令 / 纯 ID）；作者主页批量和小红书不在这一版。
+- 只支持抖音（作品链接 / 分享口令 / 纯 ID）；小红书不在这一版。
+- 批量是「顺序跑」：一次调用里多条排队跑完，不会并发出片；需要并发就开多个后台任务。
 - 首次跑要下模型（228 MB），本机已就绪。
 - 插件不上传任何文件；DeepSeek 只收到文字段落和标题/作者。
 - 火山引擎需要公网可访问的音频 URL，本地任务会退回其他引擎。

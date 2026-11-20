@@ -81,6 +81,8 @@ class Status:
 
     def __init__(self, path: Path, job_id: str, url: str):
         self.path = Path(path)
+        self.offset = 0.0   # batch mode: where this item starts on the 0-100 bar
+        self.span = 100.0   # batch mode: how much of the bar this item owns
         self.data = {
             "id": job_id,
             "pid": os.getpid(),
@@ -100,10 +102,16 @@ class Status:
         self.data["updatedAt"] = now_iso()
         self.flush()
 
+    def set_window(self, offset: float, span: float) -> None:
+        """Map this item's local 0-100 progress onto a slice of the job bar."""
+        self.offset = float(offset)
+        self.span = float(span)
+
     def stage(self, stage: str, percent: float | None = None) -> None:
         fields = {"stage": stage}
         if percent is not None:
-            fields["percent"] = round(max(0.0, min(100.0, float(percent))), 1)
+            local = max(0.0, min(100.0, float(percent)))
+            fields["percent"] = round(self.offset + self.span * local / 100.0, 1)
         self.update(**fields)
 
     def flush(self) -> None:
@@ -328,6 +336,31 @@ def merge_split_paragraphs(paras: list[str]) -> list[str]:
     return out
 
 
+def ends_sentence(text: str) -> bool:
+    """True when the paragraph looks finished (ignoring trailing quotes/brackets)."""
+    tail = text.rstrip()
+    while tail and tail[-1] in "”’」』）)】》\"'":
+        tail = tail[:-1].rstrip()
+    return bool(tail) and tail[-1] in SENT_END
+
+
+def merge_loose_paragraphs(paras: list[str]) -> list[str]:
+    """Glue a paragraph that stops mid-sentence onto the next one."""
+    out: list[str] = []
+    for para in paras:
+        text = para.strip()
+        if not text:
+            continue
+        if out and not ends_sentence(out[-1]):
+            out[-1] = out[-1] + text
+        else:
+            out.append(text)
+    if len(out) > 1 and not ends_sentence(out[-1]):
+        out[-2] = out[-2] + out[-1]
+        out.pop()
+    return out
+
+
 def apply_terms(paras: list[str], terms: dict[str, str]) -> tuple[list[str], int]:
     changes = 0
     fixed: list[str] = []
@@ -346,7 +379,7 @@ def tidy(paras: list[str], terms: dict[str, str]) -> tuple[list[str], int]:
     merged = merge_split_paragraphs(cleaned)
     merged, count = apply_terms(merged, terms)
     merged = [p for p in merged if len(p) >= 6]
-    return merged, count
+    return merge_loose_paragraphs(merged), count
 
 
 # --------------------------------------------------------------------- proofread
@@ -409,6 +442,7 @@ def call_deepseek(config: dict, paragraphs: list[str], video: dict | None) -> li
         return None
     if not paras:
         return None
+    paras = merge_loose_paragraphs(paras)
 
     # guardrails: never lose the shape of the text, never invent paragraphs
     before = sum(len(p) for p in paragraphs)
@@ -416,7 +450,7 @@ def call_deepseek(config: dict, paragraphs: list[str], video: dict | None) -> li
     if len(paras) > len(paragraphs) + 1:
         sys.stderr.write("[proofread] 段数变多，丢弃\n")
         return None
-    if before and not (0.75 <= after / before <= 1.1):
+    if before and not (0.70 <= after / before <= 1.20):
         sys.stderr.write(f"[proofread] 字数比例异常 {after}/{before}，丢弃\n")
         return None
     return paras
@@ -459,9 +493,155 @@ def write_docx(path: Path, paragraphs: list[str]) -> None:
 
 # --------------------------------------------------------------------- main
 
+def read_urls(args) -> list[str]:
+    """Collect targets from --url (newline separated) and/or --urls-file."""
+    raw: list[str] = []
+    if args.url:
+        raw.extend(re.split(r"[\r\n]+", str(args.url)))
+    if args.urls_file:
+        path = Path(args.urls_file)
+        if path.exists():
+            raw.extend(path.read_text(encoding="utf-8-sig").splitlines())
+    urls: list[str] = []
+    seen: set[str] = set()
+    for line in raw:
+        url = str(line).strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    if args.limit and int(args.limit) > 0:
+        urls = urls[: int(args.limit)]
+    return urls
+
+
+def unique_path(path: Path) -> Path:
+    """Return path, or path with ' (2)' before the suffix when it already exists."""
+    if not path.exists():
+        return path
+    stem, suffix = path.stem, path.suffix
+    for i in range(2, 100):
+        candidate = path.with_name(f"{stem} ({i}){suffix}")
+        if not candidate.exists():
+            return candidate
+    return path
+
+
+def process_one(config: dict, url: str, engine: str, home: Path, item_dir: Path,
+                status: Status) -> dict:
+    """Run one link end-to-end and return the single-item payload."""
+    item_dir.mkdir(parents=True, exist_ok=True)
+    status.update(currentUrl=url)
+
+    status.stage("download", 3)
+    result = run_cli(
+        config, url, engine, item_dir / "task",
+        log_path=item_dir / "cli.log",
+        progress_path=item_dir / "progress.json",
+        status=status,
+    )
+
+    video_ids = result.get("videoIds") or []
+    video_id = str(video_ids[0]) if video_ids else None
+    con = load_library(config)
+    try:
+        video = fetch_video(con, video_id)
+        transcript = fetch_transcript(con, (video or {}).get("aweme_id") or video_id or "")
+        terms = fetch_terms(con)
+    finally:
+        con.close()
+    if not video:
+        raise RuntimeError("素材库里没有找到这条作品")
+    if not transcript:
+        raise RuntimeError("没有找到转写结果")
+
+    segments = json.loads(transcript.get("segments_json") or "[]")
+    status.stage("asr", 88)
+
+    paragraphs = segment_paragraphs(segments)
+    raw = list(paragraphs)
+    paragraphs, term_changes = tidy(paragraphs, terms)
+
+    status.stage("proof", 92)
+    llm = call_deepseek(config, paragraphs, video)
+    if llm:
+        proof = {"by": "llm", "model": str(config.get("deepseekModel") or "deepseek-chat"),
+                 "changes": diff_count(paragraphs, llm) + term_changes}
+        paragraphs = llm
+    else:
+        proof = {"by": "rules", "model": None, "changes": term_changes}
+
+    title = sanitize_name(str(video.get("desc") or ""))
+    author = humanize_author(str(video.get("author_name") or ""))
+    out_root = Path(str(config.get("outputDir") or "") or (home / "output")) / author
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    docx_path = unique_path(out_root / f"{title}.docx")
+    write_docx(docx_path, paragraphs)
+
+    video_src = Path(str(video.get("file_path") or ""))
+    video_path = None
+    if video_src.exists():
+        video_path = unique_path(out_root / f"{title}.mp4")
+        try:
+            if video_path.resolve() != video_src.resolve():
+                shutil.move(str(video_src), str(video_path))
+        except Exception:
+            video_path = video_src
+    elif video_src:
+        video_path = video_src
+
+    # drop the intermediate audio track
+    audio = video.get("audio_path")
+    if audio:
+        try:
+            Path(str(audio)).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    text = "\n".join(paragraphs)
+    return {
+        "ok": True,
+        "url": url,
+        "title": title,
+        "author": author,
+        "engine": transcript.get("engine") or engine,
+        "model": transcript.get("model"),
+        "meta": {
+            "author": author,
+            "duration": round((video.get("duration_ms") or 0) / 1000, 1),
+            "width": video.get("width"),
+            "height": video.get("height"),
+            "size": video.get("file_size") or (video_path.stat().st_size if video_path and video_path.exists() else 0),
+        },
+        "proof": proof,
+        "paragraphs": paragraphs,
+        "text": text,
+        "wordCount": len(text),
+        "rawParagraphs": raw,
+        "videoPath": str(video_path) if video_path else None,
+        "docxPath": str(docx_path),
+    }
+
+
+def item_brief(payload: dict) -> dict:
+    if payload.get("ok") is False:
+        return {"url": payload.get("url"), "ok": False, "error": payload.get("error")}
+    return {
+        "url": payload.get("url"),
+        "ok": True,
+        "title": payload.get("title"),
+        "author": payload.get("author"),
+        "wordCount": payload.get("wordCount"),
+        "proof": payload.get("proof"),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", required=True)
+    parser.add_argument("--url", default="")
+    parser.add_argument("--urls-file", default="")
+    parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--home", required=True)
     parser.add_argument("--engine", default="")
     parser.add_argument("--job", default="")
@@ -474,105 +654,67 @@ def main() -> int:
     job_id = args.job or ("sf" + datetime.now().strftime("%y%m%d%H%M%S"))
     jobs_dir = home / "jobs"
     job_dir = jobs_dir / job_id
-    task_dir = job_dir / "task"
     job_dir.mkdir(parents=True, exist_ok=True)
-    task_dir.mkdir(parents=True, exist_ok=True)
 
-    status = Status(job_dir / "status.json", job_id, args.url)
+    urls = read_urls(args)
+    if not urls:
+        message = "没有可处理的链接"
+        status = Status(job_dir / "status.json", job_id, "")
+        status.update(status="error", error=message)
+        print()
+        print(MARKER)
+        print(json.dumps({"ok": False, "error": message}, ensure_ascii=False))
+        return 1
+
+    batch = len(urls) > 1
+    status = Status(job_dir / "status.json", job_id, urls[0])
+    if batch:
+        status.update(batch=True, itemTotal=len(urls), itemIndex=1,
+                      items=[{"url": u, "ok": None} for u in urls])
+
     try:
         engine = args.engine or str(config.get("engine") or "sensevoice")
+        items: list[dict] = []
+        for index, url in enumerate(urls, start=1):
+            if batch:
+                status.set_window((index - 1) * 100.0 / len(urls), 100.0 / len(urls))
+                status.update(itemIndex=index, currentUrl=url)
+            try:
+                payload = process_one(config, url, engine, home,
+                                      job_dir / "task" / f"item-{index:02d}", status)
+            except Exception as exc:  # noqa: BLE001 - keep the batch going
+                payload = {"ok": False, "url": url, "error": str(exc)}
+            items.append(payload)
+            if batch:
+                status.update(items=[item_brief(it) for it in items] + [{"url": u, "ok": None} for u in urls[len(items):]])
+                status.flush()
 
-        status.stage("download", 3)
-        result = run_cli(
-            config, args.url, engine, task_dir,
-            log_path=job_dir / "cli.log",
-            progress_path=job_dir / "progress.json",
-            status=status,
-        )
+        failures = [it for it in items if not it.get("ok")]
 
-        video_ids = result.get("videoIds") or []
-        video_id = str(video_ids[0]) if video_ids else None
-        con = load_library(config)
-        try:
-            video = fetch_video(con, video_id)
-            transcript = fetch_transcript(con, (video or {}).get("aweme_id") or video_id or "")
-            terms = fetch_terms(con)
-        finally:
-            con.close()
-        if not video:
-            raise RuntimeError("素材库里没有找到这条作品")
-        if not transcript:
-            raise RuntimeError("没有找到转写结果")
+        if not batch and failures:
+            raise RuntimeError(str(failures[0].get("error") or "处理失败"))
 
-        segments = json.loads(transcript.get("segments_json") or "[]")
-        status.stage("asr", 88)
-
-        paragraphs = segment_paragraphs(segments)
-        raw = list(paragraphs)
-        paragraphs, term_changes = tidy(paragraphs, terms)
-
-        status.stage("proof", 92)
-        llm = call_deepseek(config, paragraphs, video)
-        if llm:
-            proof = {"by": "llm", "model": str(config.get("deepseekModel") or "deepseek-chat"),
-                     "changes": diff_count(paragraphs, llm) + term_changes}
-            paragraphs = llm
+        if batch:
+            payload = {
+                "ok": len(failures) < len(items),
+                "batch": True,
+                "count": len(items),
+                "done": len(items) - len(failures),
+                "failed": len(failures),
+                "items": items,
+                "title": items[0].get("title") if items else None,
+                "videoPath": items[0].get("videoPath") if items else None,
+                "docxPath": items[0].get("docxPath") if items else None,
+                "text": items[0].get("text") if items else "",
+                "paragraphs": items[0].get("paragraphs") if items else [],
+            }
         else:
-            proof = {"by": "rules", "model": None, "changes": term_changes}
-
-        title = sanitize_name(str(video.get("desc") or ""))
-        author = humanize_author(str(video.get("author_name") or ""))
-        out_root = Path(str(config.get("outputDir") or "") or (home / "output")) / author
-        out_root.mkdir(parents=True, exist_ok=True)
-
-        docx_path = out_root / f"{title}.docx"
-        write_docx(docx_path, paragraphs)
-
-        video_src = Path(str(video.get("file_path") or ""))
-        video_path = None
-        if video_src.exists():
-            video_path = out_root / f"{title}.mp4"
-            try:
-                if video_path.resolve() != video_src.resolve():
-                    shutil.move(str(video_src), str(video_path))
-            except Exception:
-                video_path = video_src
-        elif video_src:
-            video_path = video_src
-
-        # drop the intermediate audio track
-        audio = video.get("audio_path")
-        if audio:
-            try:
-                Path(str(audio)).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-        text = "\n".join(paragraphs)
-        payload = {
-            "ok": True,
-            "title": title,
-            "author": author,
-            "engine": transcript.get("engine") or engine,
-            "model": transcript.get("model"),
-            "meta": {
-                "author": author,
-                "duration": round((video.get("duration_ms") or 0) / 1000, 1),
-                "width": video.get("width"),
-                "height": video.get("height"),
-                "size": video.get("file_size") or (video_path.stat().st_size if video_path and video_path.exists() else 0),
-            },
-            "proof": proof,
-            "paragraphs": paragraphs,
-            "text": text,
-            "wordCount": len(text),
-            "rawParagraphs": raw,
-            "videoPath": str(video_path) if video_path else None,
-            "docxPath": str(docx_path),
-        }
+            payload = items[0]
 
         write_json(job_dir / "result.json", payload)
-        status.update(status="done", stage="export", percent=100.0, result=payload)
+        status.update(status="done" if not failures else "error", stage="export",
+                      percent=100.0, result=payload,
+                      error=None if not failures else f"{len(failures)} 条失败")
         print()
         print(MARKER)
         print(json.dumps(payload, ensure_ascii=False))

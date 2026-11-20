@@ -170,6 +170,30 @@ function humanSize(bytes) {
 }
 
 function summarise(result) {
+  if (result && result.batch) {
+    const items = result.items || []
+    const head = `批量完成：共 ${result.count} 条，成功 ${result.done} 条，失败 ${result.failed} 条`
+    const lines = [head, '']
+    items.forEach((item, i) => {
+      if (item.ok === false) {
+        lines.push(`${i + 1}. 失败 · ${item.url}`)
+        lines.push(`   ${String(item.error || '').split('\n')[0].slice(0, 180)}`)
+        return
+      }
+      const meta = item.meta || {}
+      const proof = item.proof || {}
+      lines.push(`${i + 1}. ${item.author || '未知作者'} · ${item.title || '未命名'} · ${meta.duration || '?'} 秒 · ${item.wordCount || 0} 字`)
+      lines.push(`   校对 ${proof.by === 'llm' ? 'DeepSeek' : '本地规则'} · 改动 ${proof.changes || 0} 处`)
+      lines.push(`   mp4：${item.videoPath || '（未找到）'}`)
+      lines.push(`   Word：${item.docxPath || '（未生成）'}`)
+    })
+    const failed = items.filter((it) => it.ok === false)
+    if (failed.length) {
+      lines.push('')
+      lines.push('失败的可以单独重跑：sf_run url=<那条链接>')
+    }
+    return lines.join('\n')
+  }
   const meta = result.meta || {}
   const proof = result.proof || {}
   const lines = [
@@ -192,40 +216,66 @@ export function apply(ctx, config = {}) {
   ctx.tools.register(defineTool({
     name: 'sf_run',
     description:
-      '一条抖音链接 → 无水印 mp4 + 纯文字 Word。链路：下载 → 抽音轨 → 语音识别（默认本地 SenseVoice，0 元）→ '
+      '抖音链接 → 无水印 mp4 + 纯文字 Word。链路：下载 → 抽音轨 → 语音识别（默认本地 SenseVoice，0 元）→ '
       + '本地规则清洗 → DeepSeek 校对 → 写 docx，跑完自动删中间音轨。'
+      + 'url 里可以一行一条链接，一次跑多条（批量按顺序跑完，每条各出一份 mp4 + Word）；条数上限用 limit。'
       + '默认同步返回结果（60 秒片本机十几秒到半分钟）；传 background:true 则立即返回任务号，用 sf_job 轮询。',
     properties: {
-      url: { type: 'string', description: '抖音作品链接、分享口令（含 v.douyin.com 短链）或纯数字作品 ID' },
+      url: {
+        type: 'string',
+        description: '抖音作品链接、分享口令（含 v.douyin.com 短链）或纯数字作品 ID；可多行，一行一条，批量处理',
+      },
       engine: {
         type: 'string',
         enum: ['sensevoice', 'faster-whisper', 'dashscope', 'volc', 'official'],
         description: '识别引擎；默认用配置里的 engine（sensevoice 本地免费）',
       },
+      limit: { type: 'integer', description: '最多处理前几条（批量时防止一次跑太多），不传=全部' },
       background: { type: 'boolean', description: 'true 表示后台跑，返回 jobId，用 sf_job 查' },
     },
     required: ['url'],
     timeoutMs: RUN_TIMEOUT_MS,
     execute: async (args) => {
       const settings = effective(config)
-      const url = String(args.url || '').trim()
-      if (!url) return { ok: false, summary: '缺少 url：给一条抖音链接或分享口令', data: null }
-      const argv = ['--url', url, '--home', settings.home, '--engine', String(args.engine || settings.engine)]
+      const urls = String(args.url || '')
+        .split(/[\r\n]+/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+      if (!urls.length) return { ok: false, summary: '缺少 url：给一条抖音链接或分享口令（多行=批量）', data: null }
+
+      const limit = Number(args.limit) || 0
+      const targets = limit > 0 ? urls.slice(0, limit) : urls
+      const batch = targets.length > 1
+      const jobId = 'sf' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+      const jobDir = path.join(settings.home, 'jobs', jobId)
+      fs.mkdirSync(jobDir, { recursive: true })
+
+      const argv = ['--home', settings.home, '--engine', String(args.engine || settings.engine), '--job', jobId]
+      if (batch) {
+        const file = path.join(jobDir, 'urls.txt')
+        fs.writeFileSync(file, targets.join('\n'), 'utf8')
+        argv.push('--urls-file', file)
+      } else {
+        argv.push('--url', targets[0])
+      }
+
       if (args.background) {
-        const jobId = 'sf' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
-        const { child } = runPython(settings, [...argv, '--job', jobId], { detached: true })
+        const { child } = runPython(settings, argv, { detached: true })
         return {
           ok: true,
-          summary: `已放到后台：${jobId}（pid ${child.pid}）。用 sf_job action=status id=${jobId} 查进度。`,
-          data: { jobId, pid: child.pid, statusPath: path.join(settings.home, 'jobs', jobId, 'status.json') },
+          summary: `已放到后台：${jobId}（pid ${child.pid}，${targets.length} 条）。用 sf_job action=status id=${jobId} 查进度。`,
+          data: { jobId, pid: child.pid, count: targets.length, statusPath: path.join(jobDir, 'status.json') },
         }
       }
-      const { done } = runPython(settings, argv)
+      const { done } = runPython(settings, argv, { timeoutMs: batch ? Math.max(RUN_TIMEOUT_MS, targets.length * RUN_TIMEOUT_MS) : RUN_TIMEOUT_MS })
       const { code, stdout, stderr } = await done
       const result = parseResult(stdout)
       if (!result || !result.ok) {
         const reason = (result && result.error) || stderr.trim().split('\n').slice(-6).join('\n') || `python exit ${code}`
-        return { ok: false, summary: '失败：' + reason, data: { stderr: stderr.slice(-4000) } }
+        const partial = result && result.items
+          ? '\n' + summarise({ ...result, batch: true })
+          : ''
+        return { ok: false, summary: '失败：' + reason + partial, data: { stderr: stderr.slice(-4000), result } }
       }
       return { ok: true, summary: summarise(result), data: result }
     },

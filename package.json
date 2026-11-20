@@ -1,6 +1,6 @@
 {
   "name": "dsh-scriptflow",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Turn one Douyin link into a watermark-free mp4 plus a plain-text Word script, with DeepSeek proofreading. Host-only DSH plugin.",
@@ -17,7 +17,8 @@
     "docs",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "dsh": {
     "bundle": {
