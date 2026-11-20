@@ -7,29 +7,48 @@
 ## 安装
 
 ```
+# 1. 把仓库放到本机任意目录（link 安装，不在 profile 里复制一份）
+git clone https://github.com/xx124296314-bot/dsh-scriptflow.git E:\Tools\dsh-scriptflow
+
+# 2. 注册进 DeepSeek Harness
 plugin_manager install_bundle target=E:\Tools\dsh-scriptflow
 ```
 
 装好后工具面板会多出 `sf_run` / `sf_job` / `sf_settings`。插件以 `link:` 方式挂到 profile，改完源码重载即可生效。
 
+## 它依赖什么
+
+插件本身零 npm 依赖，真正的活由本机的 shortvideo 引擎 + ffmpeg + sherpa-onnx 干：
+
+| 依赖 | 作用 | 参考环境（本机） |
+| --- | --- | --- |
+| DeepSeek Harness（桌面版） | 宿主，提供 `tool` 与 `plugin_manager` | 任意近期版本 |
+| Python 3.10+ | 跑 `engine/run.py` | `E:\Tools\sv-engine\Scripts\python.exe` |
+| `python-docx`、`numpy` | 写 Word、音频处理 | 同上 venv |
+| `sherpa-onnx` | 本地 SenseVoice 识别 | 2.0.x |
+| shortvideo 引擎 | 下载无水印视频 + 抽音轨 + 识别 | `E:\Tools\dsh-shortvideo-export\engine` |
+| SenseVoice 模型 | 228 MB，首次要下 | `E:\Tools\shortvideo-export-home\models\...` |
+| `ffmpeg` / `ffprobe` | 抽 16 kHz 单声道 | 在 PATH 上 |
+| DeepSeek API Key（可选） | 校对；不填只走本地规则 | — |
+
+换机器时把这几个路径用 `sf_settings` 指过去即可，见下。
+
 ## 第一次使用
 
-1. 确认本机已装识别引擎依赖（本机现状）：
-   - Python 环境 `E:\Tools\sv-engine\Scripts\python.exe`（python-docx、sherpa-onnx、numpy）
-   - 识别引擎目录 `E:\Tools\dsh-shortvideo-export\engine`
-   - SenseVoice 模型在 `E:\Tools\shortvideo-export-home\models\...`（228 MB）
-   - ffmpeg 在 PATH
-2. 填 DeepSeek Key（校对用；不填就只走本地规则清洗）：
+```
+# 看当前配置（默认值、模型、引擎）
+sf_settings action=get
 
-   ```
-   sf_settings action=set key=deepseekKey value=sk-xxxx
-   ```
+# 指路径（换成你自己的）
+sf_settings action=set key=python          value=E:\Tools\sv-engine\Scripts\python.exe
+sf_settings action=set key=engineDir       value=E:\Tools\dsh-shortvideo-export\engine
+sf_settings action=set key=dataHome        value=E:\Tools\shortvideo-export-home
 
-3. 看当前配置：
+# 填 DeepSeek Key（校对用；不填就只走本地规则清洗）
+sf_settings action=set key=deepseekKey     value=sk-xxxx
+```
 
-   ```
-   sf_settings action=get
-   ```
+配置写在插件 home 的 `config.json`（默认 `E:/Tools/scriptflow-home/config.json`），不会进 git。
 
 ## 用法
 
@@ -86,7 +105,7 @@ sf_job action=cancel id=sfxxxx
 ## 校对是怎么做的
 
 1. **本地规则**：补标点、合并被切开的词、术语表替换（库里的 `terms` 表）、跨段重复字拼接。
-2. **DeepSeek**：把标题、作者、话题作为上下文，只允许改错字与断句；段数不许变多、总字数偏差超过 30% 直接丢弃这版结果。
+2. **DeepSeek**：把标题、作者、话题作为上下文，只允许改错字与断句；段数不许变多、总字数偏差超过 20% 直接丢弃这版结果；被切在段落中间的句子会拼回上一段。
 
 大模型改不了「听错」：如果识别把一句歌词听成了别的词，校对不会替你编造，需要换云端识别或加术语表。音乐/重复歌词的片子，标点和分段偶尔还会不完美。
 
@@ -97,3 +116,9 @@ sf_job action=cancel id=sfxxxx
 - 首次跑要下模型（228 MB），本机已就绪。
 - 插件不上传任何文件；DeepSeek 只收到文字段落和标题/作者。
 - 火山引擎需要公网可访问的音频 URL，本地任务会退回其他引擎。
+
+## 许可与致谢
+
+- 本仓库以 **MIT** 发布：可以自由使用、修改、二次分发，保留版权与许可声明即可。
+- 下载与识别那一段调用的是本机已装的 [shortvideo 引擎](https://github.com/hangyesite/dsh-shortvideo-export)，本仓库不包含它的代码与模型文件。
+- SenseVoice 模型由 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 提供，使用时遵守它自己的许可。
